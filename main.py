@@ -1,204 +1,389 @@
 import os
+import re
+import sys
 import json
+import shutil
 import hashlib
+import logging
 import tarfile
 import zipfile
+import tempfile
 import asyncio
+from pathlib import Path
+from typing import Any, Optional
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.channels import CreateForumTopicRequest
+from telethon.tl.functions.messages import CreateForumTopicRequest
+from telethon.tl.types import UpdateNewChannelMessage
 from dotenv import load_dotenv
+from tqdm import tqdm
 
-# بارگذاری تنظیمات از فایل .env
+
 load_dotenv()
 
-# --- پیکربندی (Configuration) ---
-API_ID = int(os.getenv('API_ID'))
-API_HASH = os.getenv('API_HASH')
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID'))
+# ── Logging ──────────────────────────────────────────────────────────
 
-STATE_FILE = os.getenv('STATE_FILE')
-PROJECTS_DIR = os.getenv('PROJECTS_DIR')
-NEXTCLOUD_DIR = os.getenv('NEXTCLOUD_DIR')
+def setup_logging(log_file: Optional[str] = None) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
 
-MAX_FILE_SIZE_GB = float(os.getenv('MAX_FILE_SIZE_GB', 1.9))
-MAX_FILE_SIZE = int(MAX_FILE_SIZE_GB * 1024 * 1024 * 1024) # تبدیل به بایت
-RETENTION_LIMIT = int(os.getenv('RETENTION_LIMIT', 10))
 
-client = TelegramClient('backup_session', API_ID, API_HASH)
+# ── Configuration ────────────────────────────────────────────────────
 
-# --- مدیریت وضعیت (State Management) ---
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"projects": {}, "nextcloud_photos": {"topic_id": None, "last_checked_timestamp": 0}}
+def load_config() -> dict[str, Any]:
+    required = [
+        "API_ID", "API_HASH", "BOT_TOKEN",
+        "GROUP_CHAT_ID", "STATE_FILE",
+        "PROJECTS_DIR", "NEXTCLOUD_DIR",
+    ]
+    missing = [v for v in required if not os.getenv(v)]
+    if missing:
+        print(f"FATAL: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
 
-def save_state(state):
-    with open(STATE_FILE, 'w') as f:
+    return {
+        "api_id": int(os.environ["API_ID"]),
+        "api_hash": os.environ["API_HASH"],
+        "bot_token": os.environ["BOT_TOKEN"],
+        "group_chat_id": int(os.environ["GROUP_CHAT_ID"]),
+        "state_file": os.environ["STATE_FILE"],
+        "projects_dir": Path(os.environ["PROJECTS_DIR"]),
+        "nextcloud_dir": Path(os.environ["NEXTCLOUD_DIR"]),
+        "session_file": os.getenv("SESSION_FILE", "backup_session"),
+        "log_file": os.getenv("LOG_FILE"),
+        "max_file_size": int(float(os.getenv("MAX_FILE_SIZE_GB", "1.9")) * 1024 ** 3),
+        "retention_limit": int(os.getenv("RETENTION_LIMIT", "10")),
+    }
+
+
+# ── State Management ─────────────────────────────────────────────────
+
+STATE_DEFAULTS = {
+    "projects": {},
+    "nextcloud_photos": {
+        "topic_id": None,
+        "last_checked_timestamp": 0,
+        "last_upload_hash": "",
+        "backups": [],
+    },
+}
+
+
+def load_state(path: str) -> dict:
+    try:
+        with open(path) as f:
+            state = json.load(f)
+        state.setdefault("projects", {})
+        nc = state.setdefault("nextcloud_photos", {})
+        nc.setdefault("topic_id", None)
+        nc.setdefault("last_checked_timestamp", 0)
+        nc.setdefault("last_upload_hash", "")
+        nc.setdefault("backups", [])
+        return state
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(STATE_DEFAULTS)
+
+
+def save_state(path: str, state: dict) -> None:
+    tmp = f"{path}.tmp"
+    Path(tmp).parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=4)
+    os.replace(tmp, path)
 
-# --- توابع کمکی (Helpers) ---
-def get_directory_hash(directory):
-    """تولید هش از محتویات دایرکتوری برای تشخیص تغییرات"""
-    sha256_hash = hashlib.sha256()
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def get_directory_snapshot(directory: Path) -> dict[str, float | int]:
+    max_mtime = 0.0
+    total_size = 0
+    file_count = 0
     for root, _, files in os.walk(directory):
-        for names in files:
-            filepath = os.path.join(root, names)
+        for name in files:
             try:
-                with open(filepath, "rb") as f:
-                    for byte_block in iter(lambda: f.read(4096), b""):
-                        sha256_hash.update(byte_block)
+                st = (Path(root, name)).stat()
+                max_mtime = max(max_mtime, st.st_mtime)
+                total_size += st.st_size
+                file_count += 1
             except OSError:
                 continue
-    return sha256_hash.hexdigest()
+    return {"max_mtime": max_mtime, "total_size": total_size, "file_count": file_count}
 
-def split_file(filepath):
-    """تکه‌تکه کردن فایل‌های بزرگ"""
-    file_size = os.path.getsize(filepath)
-    if file_size <= MAX_FILE_SIZE:
+
+def sanitize_name(name: str) -> str:
+    return re.sub(r"[^\w\-.]", "_", name)
+
+
+def split_file(filepath: Path, max_size: int, temp_dir: Path) -> list[Path]:
+    file_size = filepath.stat().st_size
+    if file_size <= max_size:
         return [filepath]
-    
-    parts = []
+
+    CHUNK = 8 * 1024 * 1024
+    parts: list[Path] = []
     part_num = 1
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(MAX_FILE_SIZE):
-            part_name = f"{filepath}.part{part_num}"
-            with open(part_name, 'wb') as p:
-                p.write(chunk)
-            parts.append(part_name)
+    with open(filepath, "rb") as src:
+        while True:
+            part_path = temp_dir / f"{filepath.name}.part{part_num}"
+            with open(part_path, "wb") as dst:
+                written = 0
+                while written < max_size:
+                    buf = src.read(min(CHUNK, max_size - written))
+                    if not buf:
+                        break
+                    dst.write(buf)
+                    written += len(buf)
+            if written == 0:
+                part_path.unlink(missing_ok=True)
+                break
+            parts.append(part_path)
             part_num += 1
     return parts
 
-async def get_or_create_topic(topic_name, state_topic_id):
-    """بررسی یا ایجاد تاپیک جدید در گروه تلگرام"""
+
+def compute_photos_hash(new_files: list[Path], base_dir: Path) -> str:
+    h = hashlib.sha256()
+    for fp in sorted(new_files):
+        rel = str(fp.relative_to(base_dir))
+        st = fp.stat()
+        h.update(f"{rel}:{st.st_mtime}:{st.st_size}".encode())
+    return h.hexdigest()
+
+
+# ── Telegram Helpers ─────────────────────────────────────────────────
+
+async def get_or_create_topic(client: TelegramClient, group_id: int, topic_name: str, state_topic_id: Optional[int]) -> int:
     if state_topic_id:
         return state_topic_id
-    result = await client(CreateForumTopicRequest(channel=GROUP_CHAT_ID, title=topic_name))
-    return result.updates[0].id
+    logger = logging.getLogger(__name__)
+    logger.info("Creating forum topic '%s' …", topic_name)
+    result = await client(CreateForumTopicRequest(peer=group_id, title=topic_name))
+    for update in result.updates:
+        if isinstance(update, UpdateNewChannelMessage):
+            return update.message.id
+    raise RuntimeError(f"Could not determine topic ID for '{topic_name}'")
 
-async def upload_files(topic_id, file_paths):
-    """آپلود فایل‌ها به تاپیک مشخص شده"""
-    msg_ids = []
-    for path in file_paths:
-        msg = await client.send_file(GROUP_CHAT_ID, path, reply_to=topic_id)
-        msg_ids.append(msg.id)
+
+async def upload_files(
+    client: TelegramClient,
+    group_id: int,
+    topic_id: int,
+    file_paths: list[Path],
+    *,
+    desc: str = "",
+) -> list[int]:
+    msg_ids: list[int] = []
+    for fp in file_paths:
+        size = fp.stat().st_size
+        label = f"{desc}{fp.name}"
+        with tqdm(total=size, desc=label, unit="B", unit_scale=True, unit_divisor=1024, leave=False) as pbar:
+
+            def callback(sent: int, total: int) -> None:
+                pbar.total = total
+                pbar.update(sent - pbar.n)
+
+            msg = await client.send_file(group_id, str(fp), reply_to=topic_id, progress_callback=callback)
+            msg_ids.append(msg.id)
     return msg_ids
 
-# --- پایپ‌لاین A: پروژه‌ها ---
-async def backup_projects(state):
-    if not os.path.exists(PROJECTS_DIR):
-        print(f"Projects directory not found: {PROJECTS_DIR}")
-        return
-    
-    for project_name in os.listdir(PROJECTS_DIR):
-        project_path = os.path.join(PROJECTS_DIR, project_name)
-        if not os.path.isdir(project_path):
-            continue
-        
-        current_hash = get_directory_hash(project_path)
-        proj_state = state["projects"].get(project_name, {"topic_id": None, "last_hash": "", "backups": []})
-        
-        if current_hash == proj_state.get("last_hash"):
-            print(f"Skipping {project_name}: No changes detected.")
-            continue
-        
-        print(f"Backing up {project_name}...")
-        archive_name = f"/tmp/{project_name}_{datetime.now().strftime('%Y%m%d')}.tar.gz"
-        
-        # 1. ساخت آرشیو
-        with tarfile.open(archive_name, "w:gz") as tar:
-            tar.add(project_path, arcname=os.path.basename(project_path))
-        
-        # 2. بررسی سایز و تکه‌تکه کردن
-        files_to_upload = split_file(archive_name)
-        
-        # 3. مدیریت تاپیک و آپلود
-        topic_id = await get_or_create_topic(f"Backup: {project_name}", proj_state.get("topic_id"))
-        proj_state["topic_id"] = topic_id
-        uploaded_msg_ids = await upload_files(topic_id, files_to_upload)
-        
-        # 4. آپدیت وضعیت و اعمال قانون نگهداری (Retention Rule)
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        proj_state["backups"].append({"date": date_str, "message_ids": uploaded_msg_ids})
-        proj_state["last_hash"] = current_hash
-        
-        # پاک کردن فایل‌های موقت
-        for f in files_to_upload:
-            if os.path.exists(f): os.remove(f)
-        if os.path.exists(archive_name): os.remove(archive_name)
-        
-        # حذف بکاپ‌های قدیمی از تلگرام
-        if len(proj_state["backups"]) > RETENTION_LIMIT:
-            oldest_backup = proj_state["backups"].pop(0)
-            await client.delete_messages(GROUP_CHAT_ID, oldest_backup["message_ids"])
-            print(f"Deleted old backup from telegram for {project_name}.")
-            
-        state["projects"][project_name] = proj_state
 
-# --- پایپ‌لاین B: عکس‌های نکست‌کلود ---
-async def backup_nextcloud_photos(state):
-    if not os.path.exists(NEXTCLOUD_DIR):
-        print(f"Nextcloud directory not found: {NEXTCLOUD_DIR}")
+async def send_summary(client: TelegramClient, group_id: int, results: dict) -> None:
+    lines = [f"✅ Auto-Backup Complete — {datetime.now():%Y-%m-%d %H:%M}"]
+    if results["projects"]:
+        lines.append(f"📁 Projects: {results['projects']} backed up")
+    if results["photos"]:
+        lines.append(f"📸 Photos: {results['photos']} new files backed up")
+    if results["errors"]:
+        lines.append(f"\n⚠️ Errors ({len(results['errors'])}):")
+        for e in results["errors"]:
+            lines.append(f"  • {e}")
+    else:
+        lines.append("\n✅ No errors")
+    try:
+        await client.send_message(group_id, "\n".join(lines))
+    except Exception:
+        logging.getLogger(__name__).warning("Failed to send summary", exc_info=True)
+
+
+# ── Pipeline A: Projects ─────────────────────────────────────────────
+
+async def backup_projects(client: TelegramClient, config: dict, state: dict, results: dict) -> None:
+    logger = logging.getLogger(__name__)
+    projects_dir: Path = config["projects_dir"]
+    if not projects_dir.is_dir():
+        logger.warning("Projects directory not found: %s", projects_dir)
         return
-    
-    nc_state = state.get("nextcloud_photos", {"topic_id": None, "last_checked_timestamp": 0})
-    last_timestamp = nc_state["last_checked_timestamp"]
-    new_files = []
-    
-    # 1. پیدا کردن فایل‌های جدید
-    for root, _, files in os.walk(NEXTCLOUD_DIR):
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="backup_projects_"))
+    try:
+        for project_name in sorted(os.listdir(projects_dir)):
+            project_path = projects_dir / project_name
+            if not project_path.is_dir():
+                continue
+
+            try:
+                current_snapshot = get_directory_snapshot(project_path)
+                proj_state = state["projects"].get(project_name, {
+                    "topic_id": None, "last_snapshot": None, "backups": [],
+                })
+
+                if current_snapshot == proj_state.get("last_snapshot"):
+                    logger.info("Skipping '%s': no changes detected.", project_name)
+                    continue
+
+                logger.info("Backing up '%s' …", project_name)
+                safe_name = sanitize_name(project_name)
+                archive_path = temp_dir / f"{safe_name}_{datetime.now():%Y%m%d}.tar.gz"
+
+                with tarfile.open(archive_path, "w:gz") as tar:
+                    tar.add(project_path, arcname=project_path.name)
+
+                parts = split_file(archive_path, config["max_file_size"], temp_dir)
+
+                topic_id = await get_or_create_topic(
+                    client, config["group_chat_id"],
+                    f"Backup: {project_name}",
+                    proj_state.get("topic_id"),
+                )
+                proj_state["topic_id"] = topic_id
+                msg_ids = await upload_files(
+                    client, config["group_chat_id"], topic_id, parts,
+                    desc=f"[{project_name}] ",
+                )
+
+                date_str = datetime.now().strftime("%Y-%m-%d")
+                proj_state["backups"].append({"date": date_str, "message_ids": msg_ids})
+                proj_state["last_snapshot"] = current_snapshot
+
+                limit = config["retention_limit"]
+                if len(proj_state["backups"]) > limit:
+                    oldest = proj_state["backups"].pop(0)
+                    await client.delete_messages(config["group_chat_id"], oldest["message_ids"])
+                    logger.info("Deleted old backup for '%s'.", project_name)
+
+                state["projects"][project_name] = proj_state
+                results["projects"] += 1
+
+            except Exception as e:
+                logger.error("Failed to backup '%s': %s", project_name, e, exc_info=True)
+                results["errors"].append(f"Projects/{project_name}: {e}")
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ── Pipeline B: Nextcloud Photos ─────────────────────────────────────
+
+async def backup_nextcloud_photos(client: TelegramClient, config: dict, state: dict, results: dict) -> None:
+    logger = logging.getLogger(__name__)
+    nc_dir: Path = config["nextcloud_dir"]
+    if not nc_dir.is_dir():
+        logger.warning("Nextcloud directory not found: %s", nc_dir)
+        return
+
+    nc_state = state["nextcloud_photos"]
+    last_ts: float = nc_state.get("last_checked_timestamp", 0)
+
+    new_files: list[Path] = []
+    for root, _, files in os.walk(nc_dir):
         for name in files:
-            filepath = os.path.join(root, name)
-            mtime = os.path.getmtime(filepath)
-            if mtime > last_timestamp:
-                new_files.append(filepath)
-                
+            fp = Path(root, name)
+            try:
+                if fp.stat().st_mtime > last_ts:
+                    new_files.append(fp)
+            except OSError:
+                continue
+
     if not new_files:
-        print("No new photos found in Nextcloud.")
+        logger.info("No new photos in Nextcloud.")
         return
-        
-    print(f"Backing up {len(new_files)} new Nextcloud photos...")
-    
-    # 2. ساخت فایل زیپ از عکس‌های جدید
-    current_time = datetime.now().timestamp()
-    archive_name = f"/tmp/Photos_{datetime.now().strftime('%Y%m%d')}.zip"
-    
-    with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for file in new_files:
-            zipf.write(file, os.path.relpath(file, NEXTCLOUD_DIR))
-            
-    # 3. بررسی سایز و آپلود
-    files_to_upload = split_file(archive_name)
-    topic_id = await get_or_create_topic("Nextcloud Photos", nc_state.get("topic_id"))
-    nc_state["topic_id"] = topic_id
-    
-    await upload_files(topic_id, files_to_upload)
-    
-    # 4. آپدیت وضعیت
-    nc_state["last_checked_timestamp"] = current_time
-    state["nextcloud_photos"] = nc_state
-    
-    # پاک کردن فایل‌های موقت
-    for f in files_to_upload:
-        if os.path.exists(f): os.remove(f)
-    if os.path.exists(archive_name): os.remove(archive_name)
 
-# --- اجرای اصلی ---
-async def main():
-    await client.start(bot_token=BOT_TOKEN)
-    state = load_state()
-    
-    print("Starting Project Backups...")
-    await backup_projects(state)
-    
-    print("Starting Nextcloud Photos Backup...")
-    await backup_nextcloud_photos(state)
-    
-    save_state(state)
-    print("Backup pipeline finished successfully.")
+    current_hash = compute_photos_hash(new_files, nc_dir)
+    if current_hash and current_hash == nc_state.get("last_upload_hash"):
+        logger.info("Same photo set detected — skipping (already uploaded).")
+        return
 
-if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    logger.info("Archiving %d new photos …", len(new_files))
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="backup_photos_"))
+    try:
+        archive_path = temp_dir / f"Photos_{datetime.now():%Y%m%d}.zip"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in new_files:
+                zf.write(fp, str(fp.relative_to(nc_dir)))
+
+        parts = split_file(archive_path, config["max_file_size"], temp_dir)
+        topic_id = await get_or_create_topic(
+            client, config["group_chat_id"], "Nextcloud Photos",
+            nc_state.get("topic_id"),
+        )
+        nc_state["topic_id"] = topic_id
+        msg_ids = await upload_files(
+            client, config["group_chat_id"], topic_id, parts,
+            desc="[Photos] ",
+        )
+
+        nc_state["last_checked_timestamp"] = datetime.now().timestamp()
+        nc_state["last_upload_hash"] = current_hash
+        nc_state.setdefault("backups", []).append({
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "message_ids": msg_ids,
+        })
+
+        limit = config["retention_limit"]
+        if len(nc_state["backups"]) > limit:
+            oldest = nc_state["backups"].pop(0)
+            await client.delete_messages(config["group_chat_id"], oldest["message_ids"])
+            logger.info("Deleted old photo backup.")
+
+        results["photos"] = len(new_files)
+
+    except Exception as e:
+        logger.error("Failed to backup Nextcloud photos: %s", e, exc_info=True)
+        results["errors"].append(f"Photos: {e}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    config = load_config()
+    setup_logging(config["log_file"])
+    logger = logging.getLogger(__name__)
+
+    state = load_state(config["state_file"])
+    results: dict[str, Any] = {"projects": 0, "photos": 0, "errors": []}
+
+    async with TelegramClient(config["session_file"], config["api_id"], config["api_hash"]) as client:
+        try:
+            await client.start(bot_token=config["bot_token"])
+            logger.info("Telegram client started.")
+        except Exception as e:
+            logger.critical("Failed to start Telegram client: %s", e, exc_info=True)
+            return
+
+        try:
+            await backup_projects(client, config, state, results)
+            await backup_nextcloud_photos(client, config, state, results)
+        except Exception as e:
+            logger.critical("Unexpected fatal error: %s", e, exc_info=True)
+            results["errors"].append(str(e))
+        else:
+            logger.info("All pipelines completed successfully.")
+        finally:
+            save_state(config["state_file"], state)
+            logger.info("State saved.")
+            await send_summary(client, config["group_chat_id"], results)
+
+    logger.info("Client disconnected.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
