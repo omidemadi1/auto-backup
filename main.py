@@ -238,89 +238,87 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
         logger.warning("Projects directory not found: %s", projects_dir)
         return
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="backup_projects_"))
-    try:
-        for project_name in sorted(os.listdir(projects_dir)):
-            project_path = projects_dir / project_name
-            if not project_path.is_dir():
+    for project_name in sorted(os.listdir(projects_dir)):
+        project_path = projects_dir / project_name
+        if not project_path.is_dir():
+            continue
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="backup_project_"))
+        try:
+            current_snapshot = get_directory_snapshot(project_path)
+            proj_state = state["projects"].get(project_name, {
+                "topic_id": None, "last_snapshot": None, "backups": [],
+            })
+
+            if current_snapshot == proj_state.get("last_snapshot"):
+                logger.info("Skipping '%s': no changes detected.", project_name)
                 continue
 
-            try:
-                current_snapshot = get_directory_snapshot(project_path)
-                proj_state = state["projects"].get(project_name, {
-                    "topic_id": None, "last_snapshot": None, "backups": [],
-                })
+            logger.info("Backing up '%s' …", project_name)
+            safe_name = sanitize_name(project_name)
+            archive_path = temp_dir / f"{safe_name}_{datetime.now():%Y%m%d}.tar.gz"
 
-                if current_snapshot == proj_state.get("last_snapshot"):
-                    logger.info("Skipping '%s': no changes detected.", project_name)
-                    continue
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(project_path, arcname=project_path.name)
 
-                logger.info("Backing up '%s' …", project_name)
-                safe_name = sanitize_name(project_name)
-                archive_path = temp_dir / f"{safe_name}_{datetime.now():%Y%m%d}.tar.gz"
+            parts = split_file(archive_path, config["max_file_size"], temp_dir)
+            total_size = archive_path.stat().st_size
+            total_size_mb = total_size / (1024 ** 2)
 
-                with tarfile.open(archive_path, "w:gz") as tar:
-                    tar.add(project_path, arcname=project_path.name)
+            topic_id_state = proj_state.get("topic_id")
+            topic_name = f"Backup: {project_name}"
 
-                parts = split_file(archive_path, config["max_file_size"], temp_dir)
-                total_size = archive_path.stat().st_size
-                total_size_mb = total_size / (1024 ** 2)
-
-                topic_id_state = proj_state.get("topic_id")
-                topic_name = f"Backup: {project_name}"
-
-                if not topic_id_state:
-                    approval_msg = (
-                        f"📁 **New Project Backup**\n\n"
-                        f"Project: `{project_name}`\n"
-                        f"Action: Create topic and upload files\n"
-                        f"Total size: {total_size_mb:.2f} MB"
-                    )
-                else:
-                    approval_msg = (
-                        f"📂 **Project Backup**\n\n"
-                        f"Project: `{project_name}`\n"
-                        f"Topic: `{topic_name}` (ID: {topic_id_state})\n"
-                        f"Action: Upload files\n"
-                        f"Total size: {total_size_mb:.2f} MB"
-                    )
-
-                approved = await wait_for_approval(client, config["admin_user_id"], approval_msg)
-                if not approved:
-                    logger.info("Skipping '%s' as requested by user.", project_name)
-                    results["skipped"] += 1
-                    continue
-
-                topic_id = await get_or_create_topic(
-                    client, group,
-                    topic_name,
-                    topic_id_state,
+            if not topic_id_state:
+                approval_msg = (
+                    f"📁 **New Project Backup**\n\n"
+                    f"Project: `{project_name}`\n"
+                    f"Action: Create topic and upload files\n"
+                    f"Total size: {total_size_mb:.2f} MB"
                 )
-                proj_state["topic_id"] = topic_id
-                msg_ids = await upload_files(
-                    client, group, topic_id, parts,
-                    desc=f"[{project_name}] ",
+            else:
+                approval_msg = (
+                    f"📂 **Project Backup**\n\n"
+                    f"Project: `{project_name}`\n"
+                    f"Topic: `{topic_name}` (ID: {topic_id_state})\n"
+                    f"Action: Upload files\n"
+                    f"Total size: {total_size_mb:.2f} MB"
                 )
 
-                date_str = datetime.now().strftime("%Y-%m-%d")
-                proj_state["backups"].append({"date": date_str, "message_ids": msg_ids})
-                proj_state["last_snapshot"] = current_snapshot
+            approved = await wait_for_approval(client, config["admin_user_id"], approval_msg)
+            if not approved:
+                logger.info("Skipping '%s' as requested by user.", project_name)
+                results["skipped"] += 1
+                continue
 
-                limit = config["retention_limit"]
-                if len(proj_state["backups"]) > limit:
-                    oldest = proj_state["backups"].pop(0)
-                    await client.delete_messages(group, oldest["message_ids"])
-                    logger.info("Deleted old backup for '%s'.", project_name)
+            topic_id = await get_or_create_topic(
+                client, group,
+                topic_name,
+                topic_id_state,
+            )
+            proj_state["topic_id"] = topic_id
+            msg_ids = await upload_files(
+                client, group, topic_id, parts,
+                desc=f"[{project_name}] ",
+            )
 
-                state["projects"][project_name] = proj_state
-                results["projects"] += 1
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            proj_state["backups"].append({"date": date_str, "message_ids": msg_ids})
+            proj_state["last_snapshot"] = current_snapshot
 
-            except Exception as e:
-                logger.error("Failed to backup '%s': %s", project_name, e, exc_info=True)
-                results["errors"].append(f"Projects/{project_name}: {e}")
+            limit = config["retention_limit"]
+            if len(proj_state["backups"]) > limit:
+                oldest = proj_state["backups"].pop(0)
+                await client.delete_messages(group, oldest["message_ids"])
+                logger.info("Deleted old backup for '%s'.", project_name)
 
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            state["projects"][project_name] = proj_state
+            results["projects"] += 1
+
+        except Exception as e:
+            logger.error("Failed to backup '%s': %s", project_name, e, exc_info=True)
+            results["errors"].append(f"Projects/{project_name}: {e}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 
