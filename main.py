@@ -3,10 +3,8 @@ import re
 import sys
 import json
 import shutil
-import hashlib
 import logging
 import tarfile
-import zipfile
 import tempfile
 import asyncio
 from pathlib import Path
@@ -40,7 +38,7 @@ def load_config() -> dict[str, Any]:
     required = [
         "API_ID", "API_HASH", "BOT_TOKEN",
         "GROUP_CHAT_ID", "STATE_FILE",
-        "PROJECTS_DIR", "NEXTCLOUD_DIR",
+        "PROJECTS_DIR",
     ]
     missing = [v for v in required if not os.getenv(v)]
     if missing:
@@ -54,7 +52,6 @@ def load_config() -> dict[str, Any]:
         "group_chat_id": int(os.environ["GROUP_CHAT_ID"]),
         "state_file": os.environ["STATE_FILE"],
         "projects_dir": Path(os.environ["PROJECTS_DIR"]),
-        "nextcloud_dir": Path(os.environ["NEXTCLOUD_DIR"]),
         "session_file": os.getenv("SESSION_FILE", "backup_session"),
         "log_file": os.getenv("LOG_FILE"),
         "max_file_size": int(float(os.getenv("MAX_FILE_SIZE_GB", "1.9")) * 1024 ** 3),
@@ -66,12 +63,6 @@ def load_config() -> dict[str, Any]:
 
 STATE_DEFAULTS = {
     "projects": {},
-    "nextcloud_photos": {
-        "topic_id": None,
-        "last_checked_timestamp": 0,
-        "last_upload_hash": "",
-        "backups": [],
-    },
 }
 
 
@@ -80,11 +71,6 @@ def load_state(path: str) -> dict:
         with open(path) as f:
             state = json.load(f)
         state.setdefault("projects", {})
-        nc = state.setdefault("nextcloud_photos", {})
-        nc.setdefault("topic_id", None)
-        nc.setdefault("last_checked_timestamp", 0)
-        nc.setdefault("last_upload_hash", "")
-        nc.setdefault("backups", [])
         return state
     except (FileNotFoundError, json.JSONDecodeError):
         return dict(STATE_DEFAULTS)
@@ -147,23 +133,14 @@ def split_file(filepath: Path, max_size: int, temp_dir: Path) -> list[Path]:
     return parts
 
 
-def compute_photos_hash(new_files: list[Path], base_dir: Path) -> str:
-    h = hashlib.sha256()
-    for fp in sorted(new_files):
-        rel = str(fp.relative_to(base_dir))
-        st = fp.stat()
-        h.update(f"{rel}:{st.st_mtime}:{st.st_size}".encode())
-    return h.hexdigest()
-
-
 # ── Telegram Helpers ─────────────────────────────────────────────────
 
-async def get_or_create_topic(client: TelegramClient, group_id: int, topic_name: str, state_topic_id: Optional[int]) -> int:
+async def get_or_create_topic(client: TelegramClient, group: Any, topic_name: str, state_topic_id: Optional[int]) -> int:
     if state_topic_id:
         return state_topic_id
     logger = logging.getLogger(__name__)
     logger.info("Creating forum topic '%s' …", topic_name)
-    result = await client(CreateForumTopicRequest(peer=group_id, title=topic_name))
+    result = await client(CreateForumTopicRequest(peer=group, title=topic_name))
     for update in result.updates:
         if isinstance(update, UpdateNewChannelMessage):
             return update.message.id
@@ -172,7 +149,7 @@ async def get_or_create_topic(client: TelegramClient, group_id: int, topic_name:
 
 async def upload_files(
     client: TelegramClient,
-    group_id: int,
+    group: Any,
     topic_id: int,
     file_paths: list[Path],
     *,
@@ -188,17 +165,15 @@ async def upload_files(
                 pbar.total = total
                 pbar.update(sent - pbar.n)
 
-            msg = await client.send_file(group_id, str(fp), reply_to=topic_id, progress_callback=callback)
+            msg = await client.send_file(group, str(fp), reply_to=topic_id, progress_callback=callback)
             msg_ids.append(msg.id)
     return msg_ids
 
 
-async def send_summary(client: TelegramClient, group_id: int, results: dict) -> None:
+async def send_summary(client: TelegramClient, group: Any, results: dict) -> None:
     lines = [f"✅ Auto-Backup Complete — {datetime.now():%Y-%m-%d %H:%M}"]
     if results["projects"]:
         lines.append(f"📁 Projects: {results['projects']} backed up")
-    if results["photos"]:
-        lines.append(f"📸 Photos: {results['photos']} new files backed up")
     if results["errors"]:
         lines.append(f"\n⚠️ Errors ({len(results['errors'])}):")
         for e in results["errors"]:
@@ -206,14 +181,14 @@ async def send_summary(client: TelegramClient, group_id: int, results: dict) -> 
     else:
         lines.append("\n✅ No errors")
     try:
-        await client.send_message(group_id, "\n".join(lines))
+        await client.send_message(group, "\n".join(lines))
     except Exception:
         logging.getLogger(__name__).warning("Failed to send summary", exc_info=True)
 
 
 # ── Pipeline A: Projects ─────────────────────────────────────────────
 
-async def backup_projects(client: TelegramClient, config: dict, state: dict, results: dict) -> None:
+async def backup_projects(client: TelegramClient, config: dict, state: dict, results: dict, group: Any) -> None:
     logger = logging.getLogger(__name__)
     projects_dir: Path = config["projects_dir"]
     if not projects_dir.is_dir():
@@ -247,13 +222,13 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
                 parts = split_file(archive_path, config["max_file_size"], temp_dir)
 
                 topic_id = await get_or_create_topic(
-                    client, config["group_chat_id"],
+                    client, group,
                     f"Backup: {project_name}",
                     proj_state.get("topic_id"),
                 )
                 proj_state["topic_id"] = topic_id
                 msg_ids = await upload_files(
-                    client, config["group_chat_id"], topic_id, parts,
+                    client, group, topic_id, parts,
                     desc=f"[{project_name}] ",
                 )
 
@@ -264,7 +239,7 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
                 limit = config["retention_limit"]
                 if len(proj_state["backups"]) > limit:
                     oldest = proj_state["backups"].pop(0)
-                    await client.delete_messages(config["group_chat_id"], oldest["message_ids"])
+                    await client.delete_messages(group, oldest["message_ids"])
                     logger.info("Deleted old backup for '%s'.", project_name)
 
                 state["projects"][project_name] = proj_state
@@ -278,78 +253,6 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-# ── Pipeline B: Nextcloud Photos ─────────────────────────────────────
-
-async def backup_nextcloud_photos(client: TelegramClient, config: dict, state: dict, results: dict) -> None:
-    logger = logging.getLogger(__name__)
-    nc_dir: Path = config["nextcloud_dir"]
-    if not nc_dir.is_dir():
-        logger.warning("Nextcloud directory not found: %s", nc_dir)
-        return
-
-    nc_state = state["nextcloud_photos"]
-    last_ts: float = nc_state.get("last_checked_timestamp", 0)
-
-    new_files: list[Path] = []
-    for root, _, files in os.walk(nc_dir):
-        for name in files:
-            fp = Path(root, name)
-            try:
-                if fp.stat().st_mtime > last_ts:
-                    new_files.append(fp)
-            except OSError:
-                continue
-
-    if not new_files:
-        logger.info("No new photos in Nextcloud.")
-        return
-
-    current_hash = compute_photos_hash(new_files, nc_dir)
-    if current_hash and current_hash == nc_state.get("last_upload_hash"):
-        logger.info("Same photo set detected — skipping (already uploaded).")
-        return
-
-    logger.info("Archiving %d new photos …", len(new_files))
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="backup_photos_"))
-    try:
-        archive_path = temp_dir / f"Photos_{datetime.now():%Y%m%d}.zip"
-        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fp in new_files:
-                zf.write(fp, str(fp.relative_to(nc_dir)))
-
-        parts = split_file(archive_path, config["max_file_size"], temp_dir)
-        topic_id = await get_or_create_topic(
-            client, config["group_chat_id"], "Nextcloud Photos",
-            nc_state.get("topic_id"),
-        )
-        nc_state["topic_id"] = topic_id
-        msg_ids = await upload_files(
-            client, config["group_chat_id"], topic_id, parts,
-            desc="[Photos] ",
-        )
-
-        nc_state["last_checked_timestamp"] = datetime.now().timestamp()
-        nc_state["last_upload_hash"] = current_hash
-        nc_state.setdefault("backups", []).append({
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "message_ids": msg_ids,
-        })
-
-        limit = config["retention_limit"]
-        if len(nc_state["backups"]) > limit:
-            oldest = nc_state["backups"].pop(0)
-            await client.delete_messages(config["group_chat_id"], oldest["message_ids"])
-            logger.info("Deleted old photo backup.")
-
-        results["photos"] = len(new_files)
-
-    except Exception as e:
-        logger.error("Failed to backup Nextcloud photos: %s", e, exc_info=True)
-        results["errors"].append(f"Photos: {e}")
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
 
 # ── Main ─────────────────────────────────────────────────────────────
 
@@ -359,7 +262,7 @@ async def main() -> None:
     logger = logging.getLogger(__name__)
 
     state = load_state(config["state_file"])
-    results: dict[str, Any] = {"projects": 0, "photos": 0, "errors": []}
+    results: dict[str, Any] = {"projects": 0, "errors": []}
 
     async with TelegramClient(config["session_file"], config["api_id"], config["api_hash"]) as client:
         try:
@@ -370,8 +273,13 @@ async def main() -> None:
             return
 
         try:
-            await backup_projects(client, config, state, results)
-            await backup_nextcloud_photos(client, config, state, results)
+            group = await client.get_entity(config["group_chat_id"])
+        except Exception as e:
+            logger.critical("Failed to resolve group entity: %s", e, exc_info=True)
+            return
+
+        try:
+            await backup_projects(client, config, state, results, group)
         except Exception as e:
             logger.critical("Unexpected fatal error: %s", e, exc_info=True)
             results["errors"].append(str(e))
@@ -380,7 +288,7 @@ async def main() -> None:
         finally:
             save_state(config["state_file"], state)
             logger.info("State saved.")
-            await send_summary(client, config["group_chat_id"], results)
+            await send_summary(client, group, results)
 
     logger.info("Client disconnected.")
 
