@@ -150,7 +150,7 @@ async def wait_for_approval(client: TelegramClient, admin_id: int, message: str,
     loop = asyncio.get_running_loop()
     future = loop.create_future()
 
-    @client.on(events.CallbackQuery(chat=admin_id))
+    @client.on(events.CallbackQuery(chats=admin_id))
     async def callback_handler(event):
         if event.message_id != sent_msg.id or future.done():
             return
@@ -264,7 +264,7 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
 
                 parts = split_file(archive_path, config["max_file_size"], temp_dir)
                 total_size = archive_path.stat().st_size
-                total_size_gb = total_size / (1024 ** 3)
+                total_size_mb = total_size / (1024 ** 2)
 
                 topic_id_state = proj_state.get("topic_id")
                 topic_name = f"Backup: {project_name}"
@@ -274,7 +274,7 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
                         f"📁 **New Project Backup**\n\n"
                         f"Project: `{project_name}`\n"
                         f"Action: Create topic and upload files\n"
-                        f"Total size: {total_size_gb:.2f} GB"
+                        f"Total size: {total_size_mb:.2f} MB"
                     )
                 else:
                     approval_msg = (
@@ -282,7 +282,7 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
                         f"Project: `{project_name}`\n"
                         f"Topic: `{topic_name}` (ID: {topic_id_state})\n"
                         f"Action: Upload files\n"
-                        f"Total size: {total_size_gb:.2f} GB"
+                        f"Total size: {total_size_mb:.2f} MB"
                     )
 
                 approved = await wait_for_approval(client, config["admin_user_id"], approval_msg)
@@ -343,6 +343,8 @@ async def main() -> None:
             return
 
         try:
+            # Resolve admin and group entities to ensure they are in Telethon's cache
+            await client.get_entity(config["admin_user_id"])
             group = await client.get_entity(config["group_chat_id"])
         except Exception as e:
             logger.critical("Failed to resolve group entity: %s", e, exc_info=True)
