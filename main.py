@@ -10,7 +10,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime
-from telethon import TelegramClient
+from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import CreateForumTopicRequest
 from telethon.tl.types import UpdateNewChannelMessage
 from dotenv import load_dotenv
@@ -38,7 +38,7 @@ def load_config() -> dict[str, Any]:
     required = [
         "API_ID", "API_HASH", "BOT_TOKEN",
         "GROUP_CHAT_ID", "STATE_FILE",
-        "PROJECTS_DIR",
+        "PROJECTS_DIR", "ADMIN_USER_ID",
     ]
     missing = [v for v in required if not os.getenv(v)]
     if missing:
@@ -49,6 +49,7 @@ def load_config() -> dict[str, Any]:
         "api_id": int(os.environ["API_ID"]),
         "api_hash": os.environ["API_HASH"],
         "bot_token": os.environ["BOT_TOKEN"],
+        "admin_user_id": int(os.environ["ADMIN_USER_ID"]),
         "group_chat_id": int(os.environ["GROUP_CHAT_ID"]),
         "state_file": os.environ["STATE_FILE"],
         "projects_dir": Path(os.environ["PROJECTS_DIR"]),
@@ -135,6 +136,45 @@ def split_file(filepath: Path, max_size: int, temp_dir: Path) -> list[Path]:
 
 # ── Telegram Helpers ─────────────────────────────────────────────────
 
+async def wait_for_approval(client: TelegramClient, admin_id: int, message: str, timeout: int = 900) -> bool:
+    """Sends a message with Approve/Skip buttons and waits for user response or timeout."""
+    logger = logging.getLogger(__name__)
+
+    # Create buttons
+    buttons = [
+        [Button.inline("Approve", b"approve"), Button.inline("Skip", b"skip")]
+    ]
+
+    sent_msg = await client.send_message(admin_id, message, buttons=buttons)
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    @client.on(events.CallbackQuery(chat=admin_id))
+    async def callback_handler(event):
+        if event.message_id != sent_msg.id or future.done():
+            return
+
+        if event.data == b"approve":
+            await event.answer("Approved")
+            await event.edit(message + "\n\n✅ **Approved**")
+            future.set_result(True)
+        elif event.data == b"skip":
+            await event.answer("Skipped")
+            await event.edit(message + "\n\n⏭️ **Skipped**")
+            future.set_result(False)
+
+    try:
+        approved = await asyncio.wait_for(future, timeout=timeout)
+        return approved
+    except asyncio.TimeoutError:
+        logger.info("Approval timed out after %s seconds.", timeout)
+        await sent_msg.edit(message + "\n\n⏰ **Timed out (Skipped)**")
+        return False
+    finally:
+        client.remove_event_handler(callback_handler)
+
+
 async def get_or_create_topic(client: TelegramClient, group: Any, topic_name: str, state_topic_id: Optional[int]) -> int:
     if state_topic_id:
         return state_topic_id
@@ -172,8 +212,10 @@ async def upload_files(
 
 async def send_summary(client: TelegramClient, group: Any, results: dict) -> None:
     lines = [f"✅ Auto-Backup Complete — {datetime.now():%Y-%m-%d %H:%M}"]
-    if results["projects"]:
+    if results.get("projects"):
         lines.append(f"📁 Projects: {results['projects']} backed up")
+    if results.get("skipped"):
+        lines.append(f"⏭️ Skipped: {results['skipped']} projects")
     if results["errors"]:
         lines.append(f"\n⚠️ Errors ({len(results['errors'])}):")
         for e in results["errors"]:
@@ -191,6 +233,7 @@ async def send_summary(client: TelegramClient, group: Any, results: dict) -> Non
 async def backup_projects(client: TelegramClient, config: dict, state: dict, results: dict, group: Any) -> None:
     logger = logging.getLogger(__name__)
     projects_dir: Path = config["projects_dir"]
+    results.setdefault("skipped", 0)
     if not projects_dir.is_dir():
         logger.warning("Projects directory not found: %s", projects_dir)
         return
@@ -220,11 +263,38 @@ async def backup_projects(client: TelegramClient, config: dict, state: dict, res
                     tar.add(project_path, arcname=project_path.name)
 
                 parts = split_file(archive_path, config["max_file_size"], temp_dir)
+                total_size = archive_path.stat().st_size
+                total_size_gb = total_size / (1024 ** 3)
+
+                topic_id_state = proj_state.get("topic_id")
+                topic_name = f"Backup: {project_name}"
+
+                if not topic_id_state:
+                    approval_msg = (
+                        f"📁 **New Project Backup**\n\n"
+                        f"Project: `{project_name}`\n"
+                        f"Action: Create topic and upload files\n"
+                        f"Total size: {total_size_gb:.2f} GB"
+                    )
+                else:
+                    approval_msg = (
+                        f"📂 **Project Backup**\n\n"
+                        f"Project: `{project_name}`\n"
+                        f"Topic: `{topic_name}` (ID: {topic_id_state})\n"
+                        f"Action: Upload files\n"
+                        f"Total size: {total_size_gb:.2f} GB"
+                    )
+
+                approved = await wait_for_approval(client, config["admin_user_id"], approval_msg)
+                if not approved:
+                    logger.info("Skipping '%s' as requested by user.", project_name)
+                    results["skipped"] += 1
+                    continue
 
                 topic_id = await get_or_create_topic(
                     client, group,
-                    f"Backup: {project_name}",
-                    proj_state.get("topic_id"),
+                    topic_name,
+                    topic_id_state,
                 )
                 proj_state["topic_id"] = topic_id
                 msg_ids = await upload_files(
